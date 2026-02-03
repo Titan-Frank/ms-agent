@@ -2,14 +2,8 @@ type: DagWorkflow
 
 orchestrator:
   next:
-    - searcher
     - collector
   agent_config: orchestrator.yaml
-
-searcher:
-  next:
-    - aggregator
-  agent_config: searcher.yaml
 
 collector:
   next:

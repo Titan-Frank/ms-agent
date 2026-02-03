@@ -96,6 +96,13 @@ handler: time_handler
 callbacks:
   - callbacks/orchestrator_callback
 
+tools:
+  file_system:
+    mcp: false
+    include:
+      - write_file
+      - delete_file_or_dir
+
 
 max_chat_round: 20
 
