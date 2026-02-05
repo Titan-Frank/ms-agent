@@ -1,0 +1,347 @@
+#!/usr/bin/env python
+"""
+Financial Chatbot - Interactive Application with Plotly Charts
+A professional financial assistant powered by LLM and AKShare data.
+"""
+import os
+import sys
+import json
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+
+# Add project root to path
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT.parent.parent))
+
+import gradio as gr
+from dotenv import load_dotenv
+from tools import get_stock_price_history, plot_stock_chart, get_stock_info, parse_stock_symbol
+
+# Load environment variables
+env_file = PROJECT_ROOT / 'config.env'
+if env_file.exists():
+    load_dotenv(env_file)
+    print(f"✓ Loaded configuration from: {env_file}")
+else:
+    print(f"⚠ Config file not found: {env_file}")
+
+
+class FinancialChatbot:
+    """Professional financial chatbot with interactive Plotly charts."""
+
+    def __init__(self):
+        """Initialize chatbot."""
+        self.enable_llm = os.getenv('ENABLE_LLM', 'false').lower() in ('true', '1', 'yes')
+
+        if self.enable_llm:
+            try:
+                from ms_agent.llm.llm import LLM
+                from omegaconf import DictConfig
+
+                llm_provider = os.getenv('LLM_PROVIDER', 'dashscope').lower()
+
+                if llm_provider == 'dashscope':
+                    llm_config = {
+                        'service': 'dashscope',
+                        'model': os.getenv('DASHSCOPE_MODEL', 'qwen-max'),
+                        'dashscope_api_key': os.getenv('DASHSCOPE_API_KEY'),
+                        'modelscope_base_url': None,
+                    }
+                else:
+                    llm_config = {
+                        'service': 'openai',
+                        'model': os.getenv('OPENAI_MODEL', 'gpt-4'),
+                        'openai_api_key': os.getenv('OPENAI_API_KEY'),
+                        'openai_base_url': os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1'),
+                    }
+
+                config = DictConfig({'llm': llm_config})
+                self.llm = LLM.from_config(config)
+                print("✓ LLM initialized successfully")
+                print(f"→ Using {llm_provider} - {llm_config['model']}")
+            except Exception as e:
+                print(f"⚠ LLM initialization failed: {e}")
+                self.llm = None
+        else:
+            self.llm = None
+            print("ℹ️ LLM mode disabled")
+
+    def chat(self, message: str, history: List) -> Tuple[List, Optional[Dict]]:
+        """
+        Process chat message and return updated history with optional Plotly chart.
+
+        Returns:
+            Tuple of (updated_history, plotly_figure_dict)
+        """
+        if not message.strip():
+            return history, None
+
+        try:
+            text_response, plotly_fig = self._process_query(message)
+
+            # Update history
+            history.append({"role": "user", "content": message})
+            history.append({"role": "assistant", "content": text_response})
+
+            return history, plotly_fig
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            error_msg = f"❌ Error: {str(e)}"
+            history.append({"role": "user", "content": message})
+            history.append({"role": "assistant", "content": error_msg})
+            return history, None
+
+    def _process_query(self, message: str) -> Tuple[str, Optional[Dict]]:
+        """Process query and return text + optional Plotly figure."""
+        message_lower = message.lower()
+        symbol = parse_stock_symbol(message)
+
+        if not symbol:
+            return """📊 **欢迎使用金融聊天机器人！**
+
+我可以帮您查询股票信息并生成交互式图表。
+
+**示例查询:**
+- "画一个特斯拉最近一个月的K线图"
+- "宁德时代近3个月的走势分析"
+- "查询比亚迪的股价信息"
+- "Show me AAPL chart"
+
+**支持的股票:**
+- 🇺🇸 美股: AAPL, TSLA, MSFT, NVDA
+- 🇨🇳 A股: 300750.SZ, 600519.SS 或直接输入中文名
+- 💬 中文名称: 特斯拉, 宁德时代, 比亚迪, 中公教育
+
+**图表交互提示:**
+- 🖱️ 鼠标拖动可缩放
+- 📌 双击重置视图
+- 💡 悬停查看详细数据
+""", None
+
+        # Determine action - chart or price query
+        if 'chart' in message_lower or 'plot' in message_lower or '图' in message_lower or '画' in message_lower or '走势' in message_lower:
+            return self._generate_chart(symbol, message)
+        else:
+            return self._get_price_summary(symbol, message), None
+
+    def _generate_chart(self, symbol: str, message: str) -> Tuple[str, Optional[object]]:
+        """Generate interactive Plotly chart."""
+        message_lower = message.lower()
+
+        # Determine chart type
+        chart_type = 'candlestick' if 'k线' in message_lower or 'candle' in message_lower else 'line'
+
+        # Determine period
+        if '3' in message and ('月' in message_lower or 'month' in message_lower):
+            period = '3mo'
+        elif '6' in message and ('月' in message_lower or 'month' in message_lower):
+            period = '6mo'
+        elif '1年' in message or '一年' in message or '1 year' in message_lower:
+            period = '1y'
+        else:
+            period = '1mo'
+
+        # Get chart data
+        result = plot_stock_chart(symbol, period=period, chart_type=chart_type)
+
+        try:
+            data = json.loads(result)
+
+            if "error" in data:
+                return f"❌ {data['error']}", None
+
+            if data.get("type") == "plotly":
+                # Get price summary for analysis
+                price_data = get_stock_price_history(symbol, period=period)
+                price_json = json.loads(price_data)
+
+                if "error" not in price_json and "summary" in price_json:
+                    summary = price_json["summary"]
+
+                    # Format analysis text
+                    change_emoji = "📈" if summary["change"] >= 0 else "📉"
+                    text = f"""📊 **{symbol} 股价分析**
+
+**关键数据指标:**
+- 当前价格: ¥{summary['current_price']:.2f}
+- 涨跌幅: {change_emoji} {summary['change']:+.2f} ({summary['change_percent']:+.2f}%)
+- 期间最高: ¥{summary['high']:.2f}
+- 期间最低: ¥{summary['low']:.2f}
+- 平均成交量: {summary['avg_volume']:,}手
+
+**趋势分析:**
+{self._analyze_trend(summary)}
+
+💡 **图表交互提示:**
+- 🖱️ 拖动鼠标可缩放查看细节
+- 📌 双击图表重置视图
+- 💡 悬停查看每日详细数据
+"""
+                    # Import plotly and create Figure from dict
+                    import plotly.graph_objects as go
+                    fig = go.Figure(data["data"])
+                    return text, fig
+                else:
+                    import plotly.graph_objects as go
+                    fig = go.Figure(data["data"])
+                    return f"📈 已生成 {symbol} 的交互式图表", fig
+            else:
+                return "❌ 图表生成失败", None
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"❌ 解析图表数据失败: {str(e)}", None
+
+    def _get_price_summary(self, symbol: str, message: str) -> str:
+        """Get price summary without chart."""
+        period = '3mo' if '3' in message and '月' in message.lower() else '1mo'
+        result = get_stock_price_history(symbol, period=period)
+
+        try:
+            data = json.loads(result)
+            if 'error' in data:
+                return f"❌ {data['error']}"
+
+            summary = data['summary']
+            change_emoji = "📈" if summary['change'] >= 0 else "📉"
+
+            return f"""📊 **{symbol} 股价摘要**
+
+**当前价格:** ¥{summary['current_price']:.2f}
+**涨跌:** {change_emoji} {summary['change']:+.2f} ({summary['change_percent']:+.2f}%)
+
+**{period} 统计数据:**
+- 📈 最高价: ¥{summary['high']:.2f}
+- 📉 最低价: ¥{summary['low']:.2f}
+- 📊 平均成交量: {summary['avg_volume']:,}手
+
+**趋势分析:**
+{self._analyze_trend(summary)}
+
+💡 输入 "画 {symbol} 图" 查看交互式走势图
+"""
+        except Exception as e:
+            return f"❌ 数据解析失败: {str(e)}"
+
+    def _analyze_trend(self, summary: dict) -> str:
+        """Analyze trend based on price data."""
+        change_pct = summary['change_percent']
+
+        if change_pct > 10:
+            return "该股呈现强势上涨趋势，涨幅超过10%，市场情绪积极。"
+        elif change_pct > 5:
+            return "该股温和上涨，涨幅在5-10%之间，总体趋势向好。"
+        elif change_pct > 0:
+            return "该股小幅上涨，整体保持稳定。"
+        elif change_pct > -5:
+            return "该股小幅下跌，处于调整阶段。"
+        elif change_pct > -10:
+            return "该股出现明显回调，跌幅在5-10%之间，需关注支撑位。"
+        else:
+            return "该股大幅下跌，跌幅超过10%，市场情绪较为悲观。"
+
+
+def create_interface():
+    """Create Gradio interface with interactive Plotly support."""
+    chatbot_instance = FinancialChatbot()
+
+    with gr.Blocks(title="💰 Financial Chatbot") as demo:
+        mode_text = "🤖 LLM Mode" if chatbot_instance.enable_llm else "🚀 Direct Mode"
+
+        gr.HTML(f"""
+        <div style="text-align: center; padding: 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+             color: white; border-radius: 15px; margin-bottom: 20px;">
+            <h1 style="margin: 0; font-size: 2.5em; font-weight: bold;">💰 Financial Chatbot</h1>
+            <p style="font-size: 1.2em; margin: 10px 0 0 0;">Your AI-powered stock analysis assistant with interactive charts</p>
+            <p style="font-size: 0.9em; margin-top: 5px; opacity: 0.9;">{mode_text} | Powered by AKShare & Plotly</p>
+        </div>
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                chatbot = gr.Chatbot(
+                    height=500,
+                    label="💬 Chat History",
+                    elem_id="chatbot"
+                )
+
+                with gr.Row():
+                    msg = gr.Textbox(
+                        placeholder="💬 输入您的查询... (例如: 画一个特斯拉最近一个月的K线图)",
+                        show_label=False,
+                        container=False,
+                        scale=9,
+                        lines=1
+                    )
+                    send_btn = gr.Button("发送 📤", scale=1, variant="primary")
+
+                gr.Examples(
+                    examples=[
+                        "画一个特斯拉最近一个月的K线图",
+                        "宁德时代近3个月的走势分析",
+                        "查询比亚迪的股价信息",
+                        "中公教育近6个月K线图",
+                        "Show me AAPL candlestick chart",
+                    ],
+                    inputs=msg,
+                    label="💡 示例查询"
+                )
+
+            with gr.Column(scale=1):
+                plotly_chart = gr.Plot(
+                    label="📈 Interactive Stock Chart",
+                    elem_id="plotly-chart"
+                )
+
+                gr.Markdown("""
+                ### 📊 图表交互说明
+
+                - **🖱️ 拖动** - 框选区域进行缩放
+                - **📌 双击** - 重置视图到原始状态
+                - **💡 悬停** - 查看每日详细数据
+                - **🔍 工具栏** - 右上角有缩放、平移等工具
+
+                #### 支持的图表类型
+                - 📈 折线图 (默认)
+                - 🕯️ K线图 (输入 "K线图" 或 "candlestick")
+                - 📊 面积图 (输入 "area")
+                """)
+
+        def respond(message, history):
+            new_history, plotly_fig = chatbot_instance.chat(message, history)
+            return "", new_history, plotly_fig
+
+        msg.submit(respond, [msg, chatbot], [msg, chatbot, plotly_chart])
+        send_btn.click(respond, [msg, chatbot], [msg, chatbot, plotly_chart])
+
+    return demo
+
+
+if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("🚀 Starting Financial Chatbot with Interactive Plotly Charts")
+    print("="*70)
+    print("\n✨ Features:")
+    print("  ✓ Interactive Plotly charts (zoom, pan, hover)")
+    print("  ✓ Real-time stock data from AKShare")
+    print("  ✓ Multi-market support (US stocks & A-shares)")
+    print("  ✓ Chinese stock name recognition")
+    print("  ✓ Professional dark theme charts")
+    print("\n📊 Chart Interactions:")
+    print("  • Drag to zoom into specific date ranges")
+    print("  • Double-click to reset view")
+    print("  • Hover to see detailed daily data")
+    print("  • Use toolbar for pan, zoom, and export")
+    print("\n" + "="*70)
+    print("\n🌐 Server starting at: http://0.0.0.0:7860")
+    print("Press Ctrl+C to stop the server\n")
+
+    demo = create_interface()
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False
+    )

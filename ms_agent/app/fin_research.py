@@ -2168,10 +2168,8 @@ class TrackedDagWorkflow(DagWorkflow):
 
 
 def create_interface():
-    with gr.Blocks(
-            title='FinResearch Workflow App',
-            theme=gr.themes.Soft(),
-            css="""
+    _theme = gr.themes.Soft()
+    _css = """
         /* Container optimization */
         .gradio-container {
             max-width: 1600px !important;
@@ -2976,7 +2974,9 @@ def create_interface():
             background: #020617;
             color: #e5e7eb;
         }
-    """) as demo:
+    """
+
+    with gr.Blocks(title='FinResearch Workflow App') as demo:
         gr.HTML("""
         <div class="main-header">
             <h1>📊 FinResearch 金融深度研究</h1>
@@ -3181,7 +3181,6 @@ def create_interface():
                             lines=16,
                             max_lines=25,
                             interactive=False,
-                            show_copy_button=True,
                             elem_classes=['resources-box', 'report-panel']
                         )
 
@@ -3307,15 +3306,15 @@ def create_interface():
                 sentiment_download
             ])
 
-    return demo
+    return demo, _theme, _css
 
 
 def launch_server(server_name: Optional[str] = '0.0.0.0',
                   server_port: Optional[int] = 7860,
                   share: bool = False):
-    demo = create_interface()
+    demo, theme, css = create_interface()
     demo.queue(default_concurrency_limit=GRADIO_DEFAULT_CONCURRENCY_LIMIT)
-    demo.launch(server_name=server_name, server_port=server_port, share=share)
+    demo.launch(server_name=server_name, server_port=server_port, share=share, theme=theme, css=css)
 
 
 if __name__ == '__main__':

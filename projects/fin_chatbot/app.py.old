@@ -1,0 +1,799 @@
+#!/usr/bin/env python
+"""
+Financial Chatbot - Interactive Application with Plotly Charts
+A professional financial assistant powered by LLM and AKShare data.
+"""
+import os
+import sys
+import json
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+
+# Add project root to path
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT.parent.parent))
+
+import gradio as gr
+from dotenv import load_dotenv
+from tools import get_stock_price_history, plot_stock_chart, get_stock_info, parse_stock_symbol
+
+# Load environment variables
+env_file = PROJECT_ROOT / 'config.env'
+if env_file.exists():
+    load_dotenv(env_file)
+    print(f"✓ Loaded configuration from: {env_file}")
+else:
+    print(f"⚠ Config file not found: {env_file}")
+
+
+class FinancialChatbot:
+    """Professional financial chatbot with interactive Plotly charts and LLM chat."""
+
+    def __init__(self):
+        """Initialize chatbot with function calling support."""
+        self.enable_llm = os.getenv('ENABLE_LLM', 'true').lower() in ('true', '1', 'yes')
+        self.chat_history = []  # Store conversation history for context
+
+        if self.enable_llm:
+            try:
+                from ms_agent.llm.llm import LLM
+                from omegaconf import DictConfig
+
+                llm_provider = os.getenv('LLM_PROVIDER', 'dashscope').lower()
+
+                if llm_provider == 'dashscope':
+                    llm_config = {
+                        'service': 'dashscope',
+                        'model': os.getenv('DASHSCOPE_MODEL', 'qwen-max'),
+                        'dashscope_api_key': os.getenv('DASHSCOPE_API_KEY'),
+                        'modelscope_base_url': None,
+                    }
+                else:
+                    llm_config = {
+                        'service': 'openai',
+                        'model': os.getenv('OPENAI_MODEL', 'gpt-4'),
+                        'openai_api_key': os.getenv('OPENAI_API_KEY'),
+                        'openai_base_url': os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1'),
+                    }
+
+                config = DictConfig({'llm': llm_config})
+                self.llm = LLM.from_config(config)
+                print("✓ LLM initialized successfully with Function Calling")
+                print(f"→ Using {llm_provider} - {llm_config['model']}")
+            except Exception as e:
+                print(f"⚠ LLM initialization failed: {e}")
+                self.llm = None
+        else:
+            self.llm = None
+            print("ℹ️ LLM mode disabled")
+
+        # Define function/tool schemas for the LLM
+        self.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_stock",
+                    "description": "搜索股票代码。当用户提到任何公司名称、股票名称时使用此工具。支持中文名称（如'胜宏科技'）、美股符号（如'AAPL'）或股票代码（如'300476'）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "股票名称或代码，例如：'胜宏科技'、'TSLA'、'300476'"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_stock_data",
+                    "description": "获取股票的历史价格数据和走势分析。用于回答关于股价、涨跌、走势等问题。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {
+                                "type": "string",
+                                "description": "股票代码，如 'TSLA'、'300476.SZ'、'600519.SS'"
+                            },
+                            "period": {
+                                "type": "string",
+                                "description": "时间周期",
+                                "enum": ["1d", "5d", "1mo", "3mo", "6mo", "1y"],
+                                "default": "1mo"
+                            },
+                            "chart_type": {
+                                "type": "string",
+                                "description": "图表类型：line(折线图)、candlestick(K线图)、area(面积图)",
+                                "enum": ["line", "candlestick", "area"],
+                                "default": "line"
+                            }
+                        },
+                        "required": ["symbol"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "compare_stocks",
+                    "description": "对比多只股票的表现。当用户想要比较、对比多只股票时使用。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "symbols": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "要对比的股票代码列表，如 ['TSLA', 'AAPL'] 或 ['300750.SZ', '002594.SZ']",
+                                "minItems": 2,
+                                "maxItems": 5
+                            },
+                            "period": {
+                                "type": "string",
+                                "description": "时间周期",
+                                "enum": ["1d", "5d", "1mo", "3mo", "6mo", "1y"],
+                                "default": "1mo"
+                            }
+                        },
+                        "required": ["symbols"]
+                    }
+                }
+            }
+        ]
+
+    def chat(self, message: str, history: List):
+        """
+        Process chat message with streaming support.
+
+        Yields:
+            Tuple of (updated_history, plotly_figure) for streaming updates
+        """
+        if not message.strip():
+            yield history, None
+            return
+
+        try:
+            # Add user message first
+            history.append({"role": "user", "content": message})
+
+            # Process query with conversation history for context
+            text_response, plotly_fig = self._process_query(message, history[:-1])
+
+            # Stream the response character by character
+            history.append({"role": "assistant", "content": ""})
+
+            for i in range(0, len(text_response), 3):  # Stream 3 chars at a time for smoother effect
+                chunk = text_response[:i+3]
+                history[-1]["content"] = chunk
+                yield history, plotly_fig
+
+            # Final complete response
+            history[-1]["content"] = text_response
+            yield history, plotly_fig
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            error_msg = f"❌ Error: {str(e)}"
+            history.append({"role": "assistant", "content": error_msg})
+            yield history, None
+
+    def _process_query(self, message: str, history: List = None) -> Tuple[str, Optional[object]]:
+        """Process query using LLM with function calling and conversation context."""
+        if not self.llm:
+            # Fallback to old logic if LLM not available
+            return self._process_query_fallback(message)
+
+        try:
+            from ms_agent.llm.utils import Message
+
+            # System prompt for function calling
+            system_prompt = """你是一个专业的金融助手，可以帮助用户查询股票信息和分析走势。
+
+当用户提到任何公司或股票时，你应该：
+1. 使用 search_stock 工具搜索股票代码
+2. 使用 get_stock_data 工具获取数据和图表
+3. 使用 compare_stocks 工具对比多只股票
+4. 基于真实数据给出专业分析
+
+**趋势分析要求：**
+- 根据涨跌幅、波动范围、成交量等数据综合分析
+- 不要使用固定模板，要根据实际情况灵活分析
+- 考虑短期波动和长期趋势
+- 指出关键的支撑位和阻力位
+
+**上下文理解：**
+- 注意对话历史，理解用户说的"它"、"这只股票"、"再看看"等代词
+- 如果用户没有明确指定，根据上下文推断
+
+**重要提示：**
+- 投资有风险，不要给出具体的买卖建议
+- 分析要基于真实数据，客观中立
+- 如果用户要求生成图表或走势图，一定要调用 get_stock_data
+"""
+
+            # Build messages with conversation history
+            messages = [Message(role='system', content=system_prompt)]
+
+            # Add conversation history for context (last 10 messages)
+            if history:
+                for msg in history[-10:]:
+                    messages.append(Message(
+                        role=msg['role'],
+                        content=msg['content']
+                    ))
+
+            # Add current message
+            messages.append(Message(role='user', content=message))
+
+            # Call LLM with tools
+            response = self.llm.generate(messages=messages, tools=self.tools)
+
+            # Check if LLM wants to call functions
+            if hasattr(response, 'tool_calls') and response.tool_calls:
+                return self._handle_tool_calls(response, message, history)
+            else:
+                # No tool call, just return text response
+                text = response.content if hasattr(response, 'content') else str(response)
+                return text, None
+
+        except Exception as e:
+            print(f"Function calling error: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to old logic
+            return self._process_query_fallback(message)
+
+    def _handle_tool_calls(self, response, original_message: str, history: List = None) -> Tuple[str, Optional[object]]:
+        """Execute tool calls and generate final response with chart."""
+        from ms_agent.llm.utils import Message
+
+        tool_results = []
+        chart_data = None
+
+        # Execute each tool call
+        for tool_call in response.tool_calls:
+            func_name = tool_call.function.name
+            func_args = json.loads(tool_call.function.arguments)
+
+            print(f"🔧 Tool call: {func_name}({func_args})")
+
+            if func_name == "search_stock":
+                result = self._tool_search_stock(func_args.get('query', ''))
+                tool_results.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": func_name,
+                    "content": result
+                })
+
+            elif func_name == "get_stock_data":
+                symbol = func_args.get('symbol', '')
+                period = func_args.get('period', '1mo')
+                chart_type = func_args.get('chart_type', 'line')
+
+                result, fig = self._tool_get_stock_data(symbol, period, chart_type)
+                tool_results.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": func_name,
+                    "content": result
+                })
+                chart_data = fig
+
+            elif func_name == "compare_stocks":
+                symbols = func_args.get('symbols', [])
+                period = func_args.get('period', '1mo')
+
+                result, fig = self._tool_compare_stocks(symbols, period)
+                tool_results.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": func_name,
+                    "content": result
+                })
+                chart_data = fig
+
+        # Build second LLM call with tool results
+        messages = [
+            Message(role='system', content="""你是专业的金融分析师。根据股票数据给出清晰、智能的分析。
+
+**分析要求：**
+1. 总结关键指标（当前价格、涨跌幅、最高/最低价、成交量）
+2. **智能分析趋势**：
+   - 不要使用固定模板或阈值
+   - 综合考虑涨跌幅、波动率、成交量变化
+   - 分析短期趋势和长期趋势
+   - 指出关键价格区间（支撑位/阻力位）
+3. 给出客观的市场观察和可能的影响因素
+4. 提醒投资风险
+
+**格式要求：**
+- 使用 Markdown 格式
+- 使用 emoji 让内容生动（但不要过度使用）
+- 分析要有深度，不要套模板
+- 绝不给出具体买卖建议
+""")
+        ]
+
+        # Add conversation history for context
+        if history:
+            for msg in history[-8:]:
+                messages.append(Message(role=msg['role'], content=msg['content']))
+
+        messages.append(Message(role='user', content=original_message))
+        messages.append(Message(role='assistant', content=response.content, tool_calls=response.tool_calls))
+
+        # Add tool results
+        for tool_result in tool_results:
+            messages.append(Message(
+                role='tool',
+                content=tool_result['content'],
+                tool_call_id=tool_result['tool_call_id']
+            ))
+
+        # Get final response from LLM
+        final_response = self.llm.generate(messages=messages)
+        final_text = final_response.content if hasattr(final_response, 'content') else str(final_response)
+
+        return final_text, chart_data
+
+    def _tool_search_stock(self, query: str) -> str:
+        """Tool implementation: Search for stock symbol."""
+        from tools import parse_stock_symbol
+
+        symbol = parse_stock_symbol(query)
+        if symbol:
+            return json.dumps({
+                "success": True,
+                "symbol": symbol,
+                "query": query,
+                "message": f"找到股票代码: {symbol}"
+            }, ensure_ascii=False)
+        else:
+            return json.dumps({
+                "success": False,
+                "query": query,
+                "message": f"未找到股票: {query}"
+            }, ensure_ascii=False)
+
+    def _tool_get_stock_data(self, symbol: str, period: str = "1mo", chart_type: str = "line") -> Tuple[str, Optional[object]]:
+        """Tool implementation: Get stock data and chart."""
+        # Get price history
+        price_result = get_stock_price_history(symbol, period=period)
+        price_data = json.loads(price_result)
+
+        if "error" in price_data:
+            return json.dumps({"error": price_data["error"]}, ensure_ascii=False), None
+
+        # Generate chart
+        chart_result = plot_stock_chart(symbol, period=period, chart_type=chart_type)
+        chart_data = json.loads(chart_result)
+
+        # Create plotly figure
+        plotly_fig = None
+        if chart_data.get("type") == "plotly":
+            import plotly.io as pio
+            plotly_fig = pio.from_json(json.dumps(chart_data["data"]))
+
+        # Return data summary for LLM
+        summary = price_data.get('summary', {})
+        result = {
+            "symbol": symbol,
+            "period": period,
+            "current_price": summary.get('current_price'),
+            "change": summary.get('change'),
+            "change_percent": summary.get('change_percent'),
+            "high": summary.get('high'),
+            "low": summary.get('low'),
+            "avg_volume": summary.get('avg_volume'),
+            "chart_generated": plotly_fig is not None
+        }
+
+        return json.dumps(result, ensure_ascii=False, indent=2), plotly_fig
+
+    def _tool_compare_stocks(self, symbols: List[str], period: str = "1mo") -> Tuple[str, Optional[object]]:
+        """Tool implementation: Compare multiple stocks."""
+        try:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+
+            comparison_data = []
+            fig_data = []
+
+            # Fetch data for each stock
+            for symbol in symbols:
+                price_result = get_stock_price_history(symbol, period=period)
+                price_data = json.loads(price_result)
+
+                if "error" not in price_data:
+                    summary = price_data.get('summary', {})
+                    comparison_data.append({
+                        "symbol": symbol,
+                        "current_price": summary.get('current_price'),
+                        "change": summary.get('change'),
+                        "change_percent": summary.get('change_percent'),
+                        "high": summary.get('high'),
+                        "low": summary.get('low'),
+                    })
+
+                    # Add line to chart (normalized to percentage change)
+                    data_points = price_data.get('data', [])
+                    if data_points:
+                        dates = [d['date'] for d in data_points]
+                        closes = [d['close'] for d in data_points]
+
+                        # Normalize to percentage change from start
+                        start_price = closes[0]
+                        pct_changes = [(c / start_price - 1) * 100 for c in closes]
+
+                        fig_data.append(go.Scatter(
+                            x=dates,
+                            y=pct_changes,
+                            mode='lines',
+                            name=symbol,
+                            line=dict(width=2),
+                            hovertemplate=f'<b>{symbol}</b><br>%{{x}}<br>涨跌: %{{y:.2f}}%<extra></extra>'
+                        ))
+
+            # Create comparison chart
+            if fig_data:
+                fig = go.Figure(data=fig_data)
+                fig.update_layout(
+                    title="股票对比 - 归一化涨跌幅 (%)",
+                    template='plotly_dark',
+                    paper_bgcolor='#0D1117',
+                    plot_bgcolor='#0D1117',
+                    font=dict(family='Arial, sans-serif', color='#C9D1D9'),
+                    height=500,
+                    xaxis_title="日期",
+                    yaxis_title="涨跌幅 (%)",
+                    hovermode='x unified',
+                    legend=dict(
+                        yanchor="top",
+                        y=0.99,
+                        xanchor="left",
+                        x=0.01
+                    )
+                )
+                fig.update_xaxes(gridcolor='#21262D', showgrid=True)
+                fig.update_yaxes(gridcolor='#21262D', showgrid=True, zeroline=True, zerolinecolor='#30363D')
+            else:
+                fig = None
+
+            # Return comparison data for LLM
+            result = {
+                "period": period,
+                "stocks": comparison_data,
+                "chart_generated": fig is not None
+            }
+
+            return json.dumps(result, ensure_ascii=False, indent=2), fig
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return json.dumps({"error": str(e)}, ensure_ascii=False), None
+
+    def _process_query_fallback(self, message: str) -> Tuple[str, Optional[object]]:
+        """Fallback to old keyword-based logic when LLM unavailable."""
+        message_lower = message.lower()
+        symbol = parse_stock_symbol(message)
+
+        # Check if it's a stock-related query
+        is_stock_query = (
+            symbol is not None or
+            'chart' in message_lower or 'plot' in message_lower or
+            '图' in message_lower or '画' in message_lower or
+            '走势' in message_lower or '股价' in message_lower or
+            '股票' in message_lower or 'stock' in message_lower or
+            'price' in message_lower
+        )
+
+        if not symbol:
+            return """📊 **欢迎使用金融聊天机器人！**
+
+我可以帮您查询股票信息并生成交互式图表。
+
+**示例查询:**
+- "画一个特斯拉最近一个月的K线图"
+- "宁德时代近3个月的走势分析"
+- "查询比亚迪的股价信息"
+- "胜宏科技怎么样？"
+
+**支持的股票:**
+- 🇺🇸 美股: AAPL, TSLA, MSFT, NVDA
+- 🇨🇳 A股: 任何中文股票名称或代码
+
+**图表交互提示:**
+- 🖱️ 鼠标拖动可缩放
+- 📌 双击重置视图
+- 💡 悬停查看详细数据
+""", None
+
+        # Determine action - chart or price query
+        if 'chart' in message_lower or 'plot' in message_lower or '图' in message_lower or '画' in message_lower or '走势' in message_lower:
+            return self._generate_chart(symbol, message)
+        else:
+            return self._get_price_summary(symbol, message), None
+
+    def _chat_with_llm(self, message: str) -> str:
+        """Chat with LLM for general conversation."""
+        try:
+            from ms_agent.llm.utils import Message
+
+            # System prompt for general chat
+            system_prompt = """你是一个专业友好的金融助手。
+
+你可以：
+1. 回答用户的一般问题和对话
+2. 提供股票查询和分析服务（用户需要提供股票代码或名称）
+3. 讨论市场趋势和行业动态
+
+关于股票推荐：
+- 不能提供具体的投资建议或保证收益
+- 可以讨论某些行业或公司的一般情况
+- 必须强调：投资有风险，需要用户自行研究和判断
+- 必须说明任何讨论都只是参考，不构成投资建议
+
+对话风格：
+- 友好、专业、客观
+- 用清晰易懂的语言
+- 适当使用 emoji 让对话更生动"""
+
+            messages = [
+                Message(role='system', content=system_prompt),
+                Message(role='user', content=message)
+            ]
+
+            response = self.llm.generate(messages=messages)
+
+            if hasattr(response, 'content') and response.content:
+                return response.content
+            else:
+                return str(response)
+
+        except Exception as e:
+            print(f"LLM error: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Fallback responses for common queries
+            if '推荐' in message or 'recommend' in message.lower():
+                return """💡 **关于股票推荐**
+
+作为 AI 助手，我不能提供具体的投资建议。但我可以帮您：
+
+1. **分析具体股票** - 告诉我股票代码（如 TSLA、300750.SZ），我可以展示其走势和数据
+2. **比较股票** - 可以分别查看多只股票的表现
+3. **行业讨论** - 讨论某个行业的一般情况
+
+**⚠️ 重要提示：**
+- 股市有风险，投资需谨慎
+- 建议咨询专业投资顾问
+- 做好充分研究后再做决策
+- 以上信息仅供参考，不构成投资建议
+
+您想了解哪个行业或哪只股票的情况？"""
+            elif '你好' in message or 'hello' in message.lower() or 'hi' in message.lower():
+                return """👋 你好！我是金融助手机器人。
+
+我可以帮您：
+- 📊 查询股票价格和走势
+- 📈 生成交互式股价图表（可缩放、拖动）
+- 💡 分析股票数据和趋势
+- 💬 回答金融相关问题
+
+**试试这些：**
+- "画一个特斯拉的K线图"
+- "宁德时代近3个月走势"
+- "AAPL 股价多少"
+
+有什么我可以帮您的吗？"""
+            else:
+                return """我是金融助手，主要帮助您查询和分析股票信息。
+
+您可以：
+- 查询具体股票（如 "TSLA 股价"）
+- 生成图表（如 "画比亚迪的走势图"）
+- 问我金融相关问题
+
+需要什么帮助吗？"""
+
+    def _generate_chart(self, symbol: str, message: str) -> Tuple[str, Optional[object]]:
+        """Generate interactive Plotly chart (fallback mode - simplified)."""
+        # In fallback mode, use sensible defaults instead of keyword matching
+        # Default to line chart and 1 month period
+        chart_type = 'line'
+        period = '1mo'
+
+        # Get chart data
+        result = plot_stock_chart(symbol, period=period, chart_type=chart_type)
+
+        try:
+            data = json.loads(result)
+
+            if "error" in data:
+                return f"❌ {data['error']}", None
+
+            if data.get("type") == "plotly":
+                # Get price summary for analysis
+                price_data = get_stock_price_history(symbol, period=period)
+                price_json = json.loads(price_data)
+
+                if "error" not in price_json and "summary" in price_json:
+                    summary = price_json["summary"]
+
+                    # Format analysis text - Just show data, let LLM do the analysis
+                    change_emoji = "📈" if summary["change"] >= 0 else "📉"
+                    text = f"""📊 **{symbol} 股价数据**
+
+**关键指标:**
+- 当前价格: ¥{summary['current_price']:.2f}
+- 涨跌幅: {change_emoji} {summary['change']:+.2f} ({summary['change_percent']:+.2f}%)
+- 期间最高: ¥{summary['high']:.2f}
+- 期间最低: ¥{summary['low']:.2f}
+- 平均成交量: {summary['avg_volume']:,}手
+
+💡 **图表交互提示:**
+- 🖱️ 拖动鼠标可缩放查看细节
+- 📌 双击图表重置视图
+- 💡 悬停查看每日详细数据
+"""
+                    # Import plotly and create Figure from JSON
+                    import plotly.io as pio
+                    fig = pio.from_json(json.dumps(data["data"]))
+                    return text, fig
+                else:
+                    import plotly.io as pio
+                    fig = pio.from_json(json.dumps(data["data"]))
+                    return f"📈 已生成 {symbol} 的交互式图表", fig
+            else:
+                return "❌ 图表生成失败", None
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"❌ 解析图表数据失败: {str(e)}", None
+
+    def _get_price_summary(self, symbol: str, message: str) -> str:
+        """Get price summary without chart."""
+        period = '3mo' if '3' in message and '月' in message.lower() else '1mo'
+        result = get_stock_price_history(symbol, period=period)
+
+        try:
+            data = json.loads(result)
+            if 'error' in data:
+                return f"❌ {data['error']}"
+
+            summary = data['summary']
+            change_emoji = "📈" if summary['change'] >= 0 else "📉"
+
+            return f"""📊 **{symbol} 股价摘要**
+
+**当前价格:** ¥{summary['current_price']:.2f}
+**涨跌:** {change_emoji} {summary['change']:+.2f} ({summary['change_percent']:+.2f}%)
+
+**{period} 统计数据:**
+- 📈 最高价: ¥{summary['high']:.2f}
+- 📉 最低价: ¥{summary['low']:.2f}
+- 📊 平均成交量: {summary['avg_volume']:,}手
+
+💡 输入 "画 {symbol} 图" 查看交互式走势图
+"""
+        except Exception as e:
+            return f"❌ 数据解析失败: {str(e)}"
+
+
+def create_interface():
+    """Create Gradio interface with interactive Plotly support."""
+    chatbot_instance = FinancialChatbot()
+
+    with gr.Blocks(title="💰 Financial Chatbot") as demo:
+        mode_text = "🤖 LLM Mode - Chat Enabled" if chatbot_instance.enable_llm else "🚀 Direct Mode"
+
+        gr.HTML(f"""
+        <div style="text-align: center; padding: 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+             color: white; border-radius: 15px; margin-bottom: 20px;">
+            <h1 style="margin: 0; font-size: 2.5em; font-weight: bold;">💰 Financial Chatbot</h1>
+            <p style="font-size: 1.2em; margin: 10px 0 0 0;">Your AI-powered stock analysis assistant with interactive charts</p>
+            <p style="font-size: 0.9em; margin-top: 5px; opacity: 0.9;">{mode_text} | Powered by AKShare & Plotly</p>
+        </div>
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                chatbot = gr.Chatbot(
+                    height=500,
+                    label="💬 Chat History",
+                    elem_id="chatbot"
+                )
+
+                with gr.Row():
+                    msg = gr.Textbox(
+                        placeholder="💬 输入您的查询... (例如: 可以推荐股票吗？或 画特斯拉K线图)",
+                        show_label=False,
+                        container=False,
+                        scale=9,
+                        lines=1
+                    )
+                    send_btn = gr.Button("发送 📤", scale=1, variant="primary")
+
+                gr.Examples(
+                    examples=[
+                        "你好，你能做什么？",
+                        "可以推荐一些股票吗？",
+                        "画一个特斯拉最近一个月的K线图",
+                        "宁德时代近3个月的走势分析",
+                        "比亚迪股价多少",
+                    ],
+                    inputs=msg,
+                    label="💡 示例查询"
+                )
+
+            with gr.Column(scale=1):
+                plotly_chart = gr.Plot(
+                    label="📈 Interactive Stock Chart",
+                    elem_id="plotly-chart"
+                )
+
+                gr.Markdown("""
+                ### 📊 图表交互说明
+
+                - **🖱️ 拖动** - 框选区域进行缩放
+                - **📌 双击** - 重置视图到原始状态
+                - **💡 悬停** - 查看每日详细数据
+                - **🔍 工具栏** - 右上角有缩放、平移等工具
+
+                #### 💬 聊天功能
+                - 支持自然语言对话
+                - 可以问我关于股票的问题
+                - 可以讨论市场趋势
+
+                #### 📈 图表类型
+                - 折线图 (默认)
+                - K线图 (输入 "K线图")
+                - 面积图 (输入 "area")
+                """)
+
+        def respond(message, history):
+            for new_history, plotly_fig in chatbot_instance.chat(message, history):
+                yield "", new_history, plotly_fig
+
+        msg.submit(respond, [msg, chatbot], [msg, chatbot, plotly_chart])
+        send_btn.click(respond, [msg, chatbot], [msg, chatbot, plotly_chart])
+
+    return demo
+
+
+if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("🚀 Starting Financial Chatbot with LLM Chat & Interactive Charts")
+    print("="*70)
+    print("\n✨ Features:")
+    print("  ✓ LLM-powered general chat (可以聊天对话)")
+    print("  ✓ Interactive Plotly charts (zoom, pan, hover)")
+    print("  ✓ Real-time stock data from AKShare")
+    print("  ✓ Multi-market support (US stocks & A-shares)")
+    print("  ✓ Chinese stock name recognition")
+    print("  ✓ Professional dark theme charts")
+    print("\n💬 Chat Examples:")
+    print("  • 你好 / Hello")
+    print("  • 可以推荐股票吗？")
+    print("  • 特斯拉怎么样？")
+    print("\n📊 Stock Query Examples:")
+    print("  • 画一个特斯拉的K线图")
+    print("  • 宁德时代股价")
+    print("  • Show me AAPL chart")
+    print("\n" + "="*70)
+    print("\n🌐 Server starting at: http://0.0.0.0:7860")
+    print("Press Ctrl+C to stop the server\n")
+
+    demo = create_interface()
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False
+    )
